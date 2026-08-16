@@ -94,8 +94,3 @@ connection already provides it.
   is unconfirmed.
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#open-questions) for details.
-
-## License
-
-No license file is included — add one appropriate for your intended use
-before publishing.
