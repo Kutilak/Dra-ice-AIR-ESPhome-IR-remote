@@ -1,0 +1,713 @@
+# =============================================================================
+# Drazice Air53 (Hisense OEM) — DG11R2-01 remote replacement for ESPHome.
+#
+# Full protocol reference: ../docs/PROTOCOL.md
+# Raw captures + decoding tool: ../docs/captures/
+#
+# Requires an IR receiver (for future capturing/debugging) and an IR
+# transmitter (LED, typically through a transistor driver) wired to the
+# GPIOs below. See ../README.md for wiring and setup instructions.
+# =============================================================================
+
+esphome:
+  name: drazice-air53
+  friendly_name: Drazice Air Conditioner
+
+# Custom "climate" entity (see components/drazice_climate/) - a local
+# external component, since ESPHome 2025.x removed the older
+# "platform: custom" lambda-based approach.
+external_components:
+  - source:
+      type: local
+      path: components
+
+esp8266:
+  board: d1_mini
+
+logger:
+  baud_rate: 115200
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+
+  ap:
+    ssid: "Drazice-Air53"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+api:
+  encryption:
+    key: !secret encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Real time from the paired Home Assistant instance - needed to encode the
+# current hour/minute into B0/B1 on every transmission (see PROTOCOL.md,
+# "Current time (clock)"), and for the on/off-timer auto-cancel below.
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# -----------------------------------------------------------------------------
+# Watches the on-timer/off-timer switches and automatically turns them off
+# once the unit would have fired the timer itself (the AC's own timer fires
+# purely on its internal clock — no IR signal is involved at that moment).
+# Without this, the switch would stay "on" in Home Assistant forever, and
+# `ac_state` would keep sending the old target time + active flag on every
+# subsequent, unrelated command (the AC reads B2-B5 in every frame
+# regardless of C1 - see PROTOCOL.md).
+#
+# Tracks the time the switch was ARMED (not just the raw HH:MM target), so
+# it correctly handles a target that crosses midnight (e.g. armed at 23:50
+# for a 00:10 target).
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 15s
+    then:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          if (!now.is_valid()) return;
+          uint16_t now_min = now.hour * 60 + now.minute;
+
+          if (id(ac_on_timer).state) {
+            uint16_t target_min = id(ac_state)[10] * 60 + id(ac_state)[11];   // B4:B5
+            uint16_t scheduled = (uint16_t)(target_min - id(on_timer_arm_minutes) + 1440) % 1440;
+            uint16_t elapsed = (uint16_t)(now_min - id(on_timer_arm_minutes) + 1440) % 1440;
+            if (elapsed >= scheduled) {
+              id(ac_on_timer).turn_off();
+            }
+          }
+
+          if (id(ac_off_timer).state) {
+            uint16_t target_min = id(ac_state)[8] * 60 + id(ac_state)[9];    // B2:B3
+            uint16_t scheduled = (uint16_t)(target_min - id(off_timer_arm_minutes) + 1440) % 1440;
+            uint16_t elapsed = (uint16_t)(now_min - id(off_timer_arm_minutes) + 1440) % 1440;
+            if (elapsed >= scheduled) {
+              id(ac_off_timer).turn_off();
+            }
+          }
+
+# -----------------------------------------------------------------------------
+# IR receiver - kept active even after protocol development, since it's
+# useful for capturing any function not yet covered.
+# -----------------------------------------------------------------------------
+remote_receiver:
+  id: ir_receiver
+  pin: GPIO5
+  dump: pronto
+
+remote_transmitter:
+  id: ir_transmitter
+  pin: GPIO4
+  carrier_duty_percent: 50%
+
+# -----------------------------------------------------------------------------
+# Current air-conditioner state as a 21-byte array, matching the captured
+# frame structure exactly (block A = index 0-5, block B = 6-13, block C =
+# 14-20). See ../docs/PROTOCOL.md for the full byte map.
+#
+# B0/B1 default to a valid-but-arbitrary "12:00" - just a fallback for the
+# brief window before Home Assistant's time is available; the transmit
+# script overwrites it with the real current time on every send.
+#
+# B2/B3/B4/B5 (timer-related bytes) default to zero - an early revision of
+# this project used a literal raw capture as the default template here,
+# which happened to have leftover timer state baked in and caused a
+# persistent "phantom" timer indicator; see PROTOCOL.md's note on B1.
+#
+# A3 = 0x82 (low nibble 2 = Cool, high nibble 8 = 24°C) — MUST match the
+# `initial_option` of the "AC Mode" select (Cool) and the `initial_value`
+# of the "AC Target Temperature" number (24°C), otherwise Home Assistant
+# would display a different mode than what's actually being transmitted.
+#
+# super_active/super_saved_* and quiet_active/quiet_saved_* remember the
+# state BEFORE Super/Quiet was activated, so it can be restored exactly on
+# deactivation.
+# -----------------------------------------------------------------------------
+globals:
+  - id: ac_state
+    type: uint8_t[21]
+    restore_value: false
+    initial_value: |-
+      {
+        0x83, 0x06, 0x00, 0x82, 0x00, 0x00,
+        0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7C,
+        0x00, 0x01, 0x00, 0x00, 0x28, 0x00, 0x29
+      }
+  - id: super_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: super_saved_a2
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: super_saved_a3
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: super_saved_c3
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: quiet_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: quiet_saved_a2
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: quiet_saved_c3
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: off_timer_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: on_timer_arm_minutes
+    type: uint16_t
+    restore_value: false
+    initial_value: '0'
+  - id: off_timer_arm_minutes
+    type: uint16_t
+    restore_value: false
+    initial_value: '0'
+
+# -----------------------------------------------------------------------------
+# Builds and transmits an IR frame from the current contents of ac_state.
+#
+# B0/B1 = current time (hour/minute) - recomputed right before EVERY
+# transmission, so the AC always receives a valid time (matching what the
+# original remote does) and never shows the "phantom timer" warning - see
+# PROTOCOL.md, "B1 is not just a clock byte", for why the off-timer active
+# flag must be OR'd back in here rather than left to the off-timer switch
+# alone.
+#
+# Block C checksum — unified formula (see PROTOCOL.md, section 4):
+#   C6 = C3 + C4 + C5 + f(C0) + f(C1) + f(C2)      (mod 256)
+#   f(x) = 2*(x & 0x07) - x
+#
+# Block B checksum — unified formula (see PROTOCOL.md, section 5):
+#   B7 = A2 ^ A3 ^ A4 ^ A5 ^ B0 ^ B1 ^ B2 ^ B3 ^ B4 ^ B5 ^ B6
+# -----------------------------------------------------------------------------
+script:
+  - id: transmit_ac_state
+    then:
+      - lambda: |-
+          // B0 = 0x80 + hour (bit 0x20 = display-backlight toggle pulse;
+          // preserved if it was just set in this same lambda by the calling
+          // code before script.execute).
+          // B1 = (off-timer active ? 0x80 : 0) | minute - bit 0x80 is the
+          // OFF-TIMER ACTIVE flag (see PROTOCOL.md), not part of the time
+          // itself. Must be OR'd back in from the persistent
+          // off_timer_active on every recompute, otherwise it would be
+          // cleared on every single transmission.
+          auto now = id(ha_time).now();
+          if (now.is_valid()) {
+            id(ac_state)[6] = (id(ac_state)[6] & 0x20) | 0x80 | (now.hour & 0x1F);
+            id(ac_state)[7] = (now.minute & 0x7F) | (id(off_timer_active) ? 0x80 : 0x00);
+          }
+
+          auto f = [](uint8_t x) -> uint8_t {
+            return (uint8_t)(2 * (x & 0x07) - x);
+          };
+          uint8_t sum = id(ac_state)[17] + id(ac_state)[18] + id(ac_state)[19];
+          sum += f(id(ac_state)[14]) + f(id(ac_state)[15]) + f(id(ac_state)[16]);
+          id(ac_state)[20] = sum;
+
+          uint8_t b7 = 0;
+          for (uint8_t i = 2; i <= 12; i++) b7 ^= id(ac_state)[i];
+          id(ac_state)[13] = b7;
+
+          auto call = id(ir_transmitter).transmit();
+          auto *data = call.get_data();
+          data->set_carrier_frequency(38000);
+
+          auto add_byte = [data](uint8_t b) {
+            for (uint8_t i = 0; i < 8; i++) {
+              bool bit = (b >> i) & 0x01;
+              data->mark(560);
+              data->space(bit ? 1690 : 560);
+            }
+          };
+
+          // Header
+          data->mark(9000);
+          data->space(4500);
+
+          // Block A (6 bytes)
+          for (uint8_t i = 0; i < 6; i++) add_byte(id(ac_state)[i]);
+
+          // gap between blocks
+          data->mark(560);
+          data->space(8100);
+
+          // Block B (8 bytes)
+          for (uint8_t i = 6; i < 14; i++) add_byte(id(ac_state)[i]);
+
+          // gap between blocks
+          data->mark(560);
+          data->space(8100);
+
+          // Block C (7 bytes)
+          for (uint8_t i = 14; i < 21; i++) add_byte(id(ac_state)[i]);
+
+          // end of frame
+          data->mark(560);
+          data->space(10100);
+
+          call.perform();
+
+switch:
+  - platform: template
+    name: "AC Power"
+    id: ac_power
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(ac_state)[18] |= 0x10;   // bit 0x10 in C4 = POWER ON
+          id(ac_state)[15] = 0x01;    // C1 = "power" family code
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          id(ac_state)[18] &= ~0x10;  // bit 0x10 in C4 = POWER OFF
+          id(ac_state)[15] = 0x01;    // C1 = "power" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Quiet Mode"
+    id: ac_quiet
+    optimistic: true
+    turn_on_action:
+      - if:
+          # In Dry mode the real remote ignores quiet - sends nothing.
+          # Replicated here: in Dry, don't change state and send nothing.
+          condition:
+            lambda: 'return (id(ac_state)[3] & 0x0F) != 3;'
+          then:
+            - lambda: |-
+                if (!id(quiet_active)) {
+                  // save state BEFORE activating quiet, to restore it on turn-off
+                  id(quiet_saved_a2) = id(ac_state)[2];
+                  id(quiet_saved_c3) = id(ac_state)[17];
+                  id(quiet_active) = true;
+                }
+                id(ac_state)[14] |= 0x04;   // bit 0x04 in C0 = QUIET ON
+                // fan speed -> Min (byte-verified in both cooling and fan-only)
+                id(ac_state)[2] = (id(ac_state)[2] & 0xFC) | 0x03;
+                id(ac_state)[17] = 0x00;
+                id(ac_state)[15] = 0x0B;    // C1 = "quiet" family code
+            - script.execute: transmit_ac_state
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return (id(ac_state)[3] & 0x0F) != 3;'
+          then:
+            - lambda: |-
+                id(ac_state)[14] &= ~0x04;  // bit 0x04 in C0 = QUIET OFF
+                if (id(quiet_active)) {
+                  // restore the exact previous fan speed (not hard-coded Auto)
+                  id(ac_state)[2] = id(quiet_saved_a2);
+                  id(ac_state)[17] = id(quiet_saved_c3);
+                  id(quiet_active) = false;
+                }
+                id(ac_state)[15] = 0x0B;    // C1 = "quiet" family code
+            - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Super Mode"
+    id: ac_super
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          if (!id(super_active)) {
+            // save state BEFORE activating super, to restore it on turn-off
+            id(super_saved_a2) = id(ac_state)[2];
+            id(super_saved_a3) = id(ac_state)[3];
+            id(super_saved_c3) = id(ac_state)[17];
+            id(super_active) = true;
+          }
+
+          uint8_t mode_nibble = id(ac_state)[3] & 0x0F;
+          uint8_t new_mode = mode_nibble;
+          uint8_t new_temp_nibble;
+          uint8_t fan_speed;  // 0=Auto, 1=Max - depends on the RESULTING mode (byte-verified)
+
+          if (mode_nibble == 0) {
+            new_temp_nibble = 0x0E;  // heat -> 30°C
+            fan_speed = 0;           // heat -> fan Auto
+          } else if (mode_nibble == 2) {
+            new_temp_nibble = 0x00;  // cool -> 16°C
+            fan_speed = 1;           // cool -> fan Max
+          } else {
+            // dry (3) or fan only (4) -> super "borrows" cooling at 16°C
+            // (byte-verified via capture_06 - dry and fan-only identical)
+            new_mode = 2;
+            new_temp_nibble = 0x00;
+            fan_speed = 1;           // resulting mode is cool -> fan Max
+          }
+
+          id(ac_state)[3] = (new_temp_nibble << 4) | (new_mode & 0x0F);
+          id(ac_state)[2] = (id(ac_state)[2] & 0xFC) | fan_speed;
+          id(ac_state)[17] = 0x00;
+          id(ac_state)[5] = 0x90;      // A5 = super flag ON
+          id(ac_state)[15] = 0x04;     // C1 = "super" family code
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          if (id(super_active)) {
+            id(ac_state)[2] = id(super_saved_a2);
+            id(ac_state)[3] = id(super_saved_a3);
+            id(ac_state)[17] = id(super_saved_c3);
+            id(super_active) = false;
+          }
+          id(ac_state)[5] = 0x00;      // A5 = super flag OFF
+          id(ac_state)[15] = 0x04;     // C1 = "super" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Economy Mode"
+    id: ac_economy
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(ac_state)[14] |= 0x20;   // bit 0x20 in C0 = ECONOMY ON
+          id(ac_state)[15] = 0x0C;    // C1 = "economy" family code
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          id(ac_state)[14] &= ~0x20;  // bit 0x20 in C0 = ECONOMY OFF
+          id(ac_state)[15] = 0x0C;    // C1 = "economy" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC iFeel"
+    id: ac_ifeel
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(ac_state)[11] |= 0x80;   // bit 0x80 in B5 = IFEEL ON
+          id(ac_state)[15] = 0x0D;    // C1 = "ifeel" family code
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          id(ac_state)[11] &= ~0x80;  // bit 0x80 in B5 = IFEEL OFF
+          id(ac_state)[12] = 0x00;    // B6 = room temperature - reset to zero
+          id(ac_state)[15] = 0x0D;    // C1 = "ifeel" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC On-Timer"
+    id: ac_on_timer
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Hour/minute are read from the "staging" number entities - same
+          // as on the real remote, where you dial in a time on the display
+          // and only the confirm press actually sends it.
+          id(ac_state)[9] = 0x80;                          // bit 0x80 in B3 = ON-TIMER active
+          id(ac_state)[10] = (uint8_t) id(ac_on_timer_hour).state;    // B4 = target hour
+          id(ac_state)[11] = (uint8_t) id(ac_on_timer_minute).state;  // B5 = target minute
+          id(ac_state)[15] = 0x05;    // C1 = "on-timer" family code
+          // Arm time - needed to correctly handle a midnight rollover in the
+          // auto-cancel logic above.
+          auto arm_now = id(ha_time).now();
+          if (arm_now.is_valid()) {
+            id(on_timer_arm_minutes) = arm_now.hour * 60 + arm_now.minute;
+          }
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          id(ac_state)[9] = 0x00;     // B3 = ON-TIMER inactive
+          id(ac_state)[10] = 0x00;    // B4 = target hour reset to zero
+          id(ac_state)[11] = 0x00;    // B5 = target minute reset to zero
+          id(ac_state)[15] = 0x05;    // C1 = "on-timer" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Off-Timer"
+    id: ac_off_timer
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Hour/minute are read from the "staging" number entities, same
+          // as the on-timer. The active flag is NOT in B2/B3, but bit 0x80
+          // in B1 - OR'd in later, in transmit_ac_state (see PROTOCOL.md),
+          // since B1 is recomputed from the current time there anyway.
+          id(off_timer_active) = true;
+          id(ac_state)[8] = (uint8_t) id(ac_off_timer_hour).state;    // B2 = target hour
+          id(ac_state)[9] = (uint8_t) id(ac_off_timer_minute).state;  // B3 = target minute
+          id(ac_state)[15] = 0x1D;    // C1 = "off-timer" family code
+          // Arm time - needed to correctly handle a midnight rollover in the
+          // auto-cancel logic above.
+          auto arm_now = id(ha_time).now();
+          if (arm_now.is_valid()) {
+            id(off_timer_arm_minutes) = arm_now.hour * 60 + arm_now.minute;
+          }
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          id(off_timer_active) = false;
+          id(ac_state)[8] = 0x00;     // B2 = target hour reset to zero
+          id(ac_state)[9] = 0x00;     // B3 = target minute reset to zero
+          id(ac_state)[15] = 0x1D;    // C1 = "off-timer" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Sleep Mode"
+    id: ac_sleep
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(ac_state)[2] |= 0x08;    // bit 0x08 in A2 = SLEEP ON
+          id(ac_state)[15] = 0x03;    // C1 = "sleep" family code
+      - script.execute: transmit_ac_state
+    turn_off_action:
+      - lambda: |-
+          id(ac_state)[2] &= ~0x08;   // bit 0x08 in A2 = SLEEP OFF
+          id(ac_state)[15] = 0x03;    // C1 = "sleep" family code
+      - script.execute: transmit_ac_state
+
+number:
+  - platform: template
+    name: "AC Target Temperature"
+    id: ac_temperature
+    unit_of_measurement: "°C"
+    min_value: 16
+    max_value: 30
+    step: 1
+    optimistic: true
+    initial_value: 24
+    set_action:
+      - lambda: |-
+          // NOTE: doesn't work correctly while in Smart mode (low nibble of
+          // A3 == 1) - use "AC Smart Temperature Offset" below in that case.
+          uint8_t t = (uint8_t) x;
+          // high nibble of A3 = (temperature - 16), low nibble (mode) unchanged
+          id(ac_state)[3] = (id(ac_state)[3] & 0x0F) | (((t - 16) & 0x0F) << 4);
+          id(ac_state)[15] = 0x02;    // C1 = "temperature" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Smart Temperature Offset"
+    id: ac_smart_offset
+    min_value: -7
+    max_value: 7
+    step: 1
+    optimistic: true
+    initial_value: 0
+    set_action:
+      - if:
+          # Only meaningful in Smart mode (low nibble of A3 == 1) - the real
+          # remote wouldn't even offer this control otherwise.
+          condition:
+            lambda: 'return (id(ac_state)[3] & 0x0F) == 1;'
+          then:
+            - lambda: |-
+                int offset = (int) x;                    // -7..+7
+                uint8_t magnitude = (uint8_t) abs(offset);
+                bool negative = offset < 0;
+
+                uint8_t a2_nibble = (magnitude > 2 ? 2 : magnitude) | (negative ? 0x04 : 0x00);
+                uint8_t excess = (magnitude > 2) ? (magnitude - 2) : 0;
+
+                id(ac_state)[2] = a2_nibble << 4;   // high nibble of A2, low nibble always 0 in Smart
+                id(ac_state)[16] = excess * 4;      // C2 = remainder beyond the A2 nibble
+                id(ac_state)[15] = 0x02;            // C1 = "temperature" family code
+            - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC iFeel Room Temperature"
+    id: ac_ifeel_temperature
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 50
+    step: 1
+    optimistic: true
+    initial_value: 20
+    set_action:
+      - lambda: |-
+          // Raw number (not BCD), see PROTOCOL.md. Set independently of
+          // turning iFeel on/off - a HA automation can keep feeding this
+          // from a real temperature sensor while iFeel is enabled.
+          id(ac_state)[12] = (uint8_t) x;  // B6 = room temperature
+          id(ac_state)[15] = 0x0D;         // C1 = "ifeel" family code
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC On-Timer Hour"
+    id: ac_on_timer_hour
+    min_value: 0
+    max_value: 23
+    step: 1
+    optimistic: true
+    initial_value: 6
+    # Staging value - sends nothing on its own, read when "AC On-Timer" is turned on
+
+  - platform: template
+    name: "AC On-Timer Minute"
+    id: ac_on_timer_minute
+    min_value: 0
+    max_value: 59
+    step: 1
+    optimistic: true
+    initial_value: 0
+    # Staging value - sends nothing on its own, read when "AC On-Timer" is turned on
+
+  - platform: template
+    name: "AC Off-Timer Hour"
+    id: ac_off_timer_hour
+    min_value: 0
+    max_value: 23
+    step: 1
+    optimistic: true
+    initial_value: 22
+    # Staging value - sends nothing on its own, read when "AC Off-Timer" is turned on
+
+  - platform: template
+    name: "AC Off-Timer Minute"
+    id: ac_off_timer_minute
+    min_value: 0
+    max_value: 59
+    step: 1
+    optimistic: true
+    initial_value: 0
+    # Staging value - sends nothing on its own, read when "AC Off-Timer" is turned on
+
+select:
+  - platform: template
+    name: "AC Mode"
+    id: ac_mode
+    optimistic: true
+    options:
+      - "Cool"
+      - "Dry"
+      - "Fan Only"
+      - "Heat"
+      - "Smart"
+    initial_option: "Cool"
+    set_action:
+      - lambda: |-
+          uint8_t mode_nibble = 0;       // 0 = Heat (default/fallback)
+          uint8_t c1 = 0x06;              // C1 = "mode" family code (default)
+          if (x == "Cool")            mode_nibble = 2;
+          else if (x == "Dry")        mode_nibble = 3;
+          else if (x == "Fan Only")   mode_nibble = 4;
+          else if (x == "Heat")       mode_nibble = 0;
+          else if (x == "Smart")      { mode_nibble = 1; c1 = 0x17; }
+
+          // low nibble of A3 = mode, high nibble (temperature) unchanged
+          id(ac_state)[3] = (id(ac_state)[3] & 0xF0) | (mode_nibble & 0x0F);
+          // high nibble of A2 and C2 = relative temperature offset in Smart
+          // mode - always reset on mode change (matches "Smart activation" state)
+          id(ac_state)[2] = id(ac_state)[2] & 0x0F;
+          id(ac_state)[16] = 0x00;
+          id(ac_state)[15] = c1;
+      - script.execute: transmit_ac_state
+
+  - platform: template
+    name: "AC Fan Speed"
+    id: ac_fan
+    optimistic: true
+    options:
+      - "Auto"
+      - "Max"
+      - "Medium-High"
+      - "Medium"
+      - "Medium-Low"
+      - "Min"
+    initial_option: "Auto"
+    set_action:
+      - lambda: |-
+          // A2 low 2 bits = coarse speed (0=Auto,1=Max,2=Medium,3=Min)
+          // C3 bit 0x40 = "nudge one step up", combines only with Max and Min
+          uint8_t speed = 0;
+          bool half_step = false;
+          if (x == "Auto")             { speed = 0; half_step = false; }
+          else if (x == "Max")         { speed = 1; half_step = false; }
+          else if (x == "Medium-High") { speed = 1; half_step = true;  }
+          else if (x == "Medium")      { speed = 2; half_step = false; }
+          else if (x == "Medium-Low")  { speed = 3; half_step = true;  }
+          else if (x == "Min")         { speed = 3; half_step = false; }
+
+          id(ac_state)[2] = (id(ac_state)[2] & 0xFC) | (speed & 0x03);
+          id(ac_state)[17] = half_step ? 0x40 : 0x00;
+          id(ac_state)[15] = 0x11;      // C1 = "fan speed" family code
+      - script.execute: transmit_ac_state
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+
+  - platform: wifi_signal
+    name: "Wi-Fi Signal Strength"
+    update_interval: 60s
+
+button:
+  - platform: template
+    name: "AC Swing (Toggle)"
+    id: ac_swing
+    on_press:
+      - lambda: |-
+          // Stateless "toggle" pulse - the same bit is sent on every press,
+          // the AC handles the actual louver position itself (see PROTOCOL.md).
+          // OR (not a plain assignment): B2 shares its byte with the
+          // off-timer hour (0-23, never uses bit 0x40), so the hour is
+          // preserved.
+          id(ac_state)[8] |= 0x40;   // bit 0x40 in B2 = swing pulse
+          id(ac_state)[15] = 0x07;   // C1 = "swing" family code
+      - script.execute: transmit_ac_state
+      - lambda: |-
+          // IMPORTANT: this bit must only be sent in this one frame. The AC
+          // evidently evaluates it in EVERY received frame (not just ones
+          // with C1=swing) - if left set in ac_state, every subsequent,
+          // unrelated command (mode change, temperature...) would
+          // accidentally send another swing pulse. Clear it right after
+          // sending.
+          id(ac_state)[8] &= ~0x40;
+
+  - platform: template
+    name: "AC Display Backlight (Toggle)"
+    on_press:
+      - lambda: |-
+          // Stateless "toggle" pulse - the same bit is sent on every press,
+          // the unit handles the actual backlight state itself (see PROTOCOL.md).
+          id(ac_state)[6] |= 0x20;  // bit 0x20 in B0 = backlight pulse
+          id(ac_state)[15] = 0x00;  // C1 = "display backlight" family code
+      - script.execute: transmit_ac_state
+      - lambda: |-
+          // IMPORTANT (same reasoning as swing): this bit must only be sent
+          // in this one frame. Without clearing it, it would stay stuck set
+          // in ac_state and every subsequent, unrelated command would
+          // accidentally send another backlight toggle pulse.
+          id(ac_state)[6] &= ~0x20;
+
+  - platform: restart
+    name: "Restart Device"
+
+# -----------------------------------------------------------------------------
+# One "climate" entity for convenient everyday control (a native HA
+# thermostat card): mode, temperature/Smart offset, fan speed, swing.
+# Implemented in components/drazice_climate/ - it just calls the same API
+# the direct entity controls above would call, nothing is duplicated or
+# bypassed.
+# -----------------------------------------------------------------------------
+climate:
+  - platform: drazice_climate
+    name: "Drazice Air Conditioner"
+    id: ac_climate
+    power_id: ac_power
+    mode_id: ac_mode
+    temperature_id: ac_temperature
+    smart_offset_id: ac_smart_offset
+    fan_id: ac_fan
+    swing_id: ac_swing
