@@ -19,9 +19,14 @@ the raw data it was derived from.
   one place.
 - Every other remote function as its own entity, independently usable:
   Power, Quiet, Super, Economy, Sleep, iFeel (with room-temperature input),
-  On-timer, Off-timer (both with auto-clearing switches once the target
-  time passes), Swing toggle, Display backlight toggle, Mode, Fan speed,
-  Target temperature, Smart mode temperature offset.
+  On-timer, Off-timer, Swing toggle, Display backlight toggle, Mode, Fan
+  speed, Target temperature, Smart mode temperature offset.
+- On/Off-timer switches don't just clear themselves once the target time
+  passes — they directly turn the AC's power on/off at that moment (a
+  short ~5s safety margin after the target, then deactivate + apply). This
+  makes the actual outcome independent of the unit's own internal timer
+  firing correctly, and keeps the "AC Power" switch in Home Assistant
+  showing the real expected state.
 - The `climate` entity is a thin wrapper around the individual entities —
   it calls the exact same code path, nothing is duplicated.
 - IR receiver stays active at runtime, so you can keep capturing/verifying
@@ -94,3 +99,8 @@ connection already provides it.
   is unconfirmed.
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#open-questions) for details.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). Keep the copyright notice intact in any
+copy or fork.

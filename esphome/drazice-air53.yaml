@@ -64,34 +64,63 @@ time:
 # subsequent, unrelated command (the AC reads B2-B5 in every frame
 # regardless of C1 - see PROTOCOL.md).
 #
+# Once the target time is reached, waits an extra ~5s safety margin, then
+# (a) deactivates the timer switch (clears ac_state, same as before) and
+# (b) directly toggles AC power via the same, already-tested "AC Power"
+# switch action a manual toggle would use. This is deliberate: instead of
+# relying on the unit's own internal timer firing correctly (which depends
+# on getting every "armed" byte exactly right), the ESP takes direct
+# control of the actual outcome a timer is for - the AC actually turning
+# on/off at the target time - so it no longer depends on protocol details
+# that might still be subtly wrong. It also means the "AC Power" switch in
+# Home Assistant automatically ends up reflecting the real state, with no
+# separate/ad-hoc logic.
+#
 # Tracks the time the switch was ARMED (not just the raw HH:MM target), so
 # it correctly handles a target that crosses midnight (e.g. armed at 23:50
 # for a 00:10 target).
 # -----------------------------------------------------------------------------
 interval:
-  - interval: 15s
+  - interval: 5s
     then:
       - lambda: |-
           auto now = id(ha_time).now();
           if (!now.is_valid()) return;
           uint16_t now_min = now.hour * 60 + now.minute;
+          uint32_t now_ms = millis();
 
           if (id(ac_on_timer).state) {
-            uint16_t target_min = id(ac_state)[10] * 60 + id(ac_state)[11];   // B4:B5
+            uint16_t target_min = id(ac_state)[10] * 60 + (id(ac_state)[11] & 0x7F);   // B4:B5 (bit 0x80 in B5 = iFeel flag, not minute)
             uint16_t scheduled = (uint16_t)(target_min - id(on_timer_arm_minutes) + 1440) % 1440;
             uint16_t elapsed = (uint16_t)(now_min - id(on_timer_arm_minutes) + 1440) % 1440;
-            if (elapsed >= scheduled) {
-              id(ac_on_timer).turn_off();
+            if (!id(on_timer_fired) && elapsed >= scheduled) {
+              id(on_timer_fired) = true;
+              id(on_timer_fired_at_ms) = now_ms;
             }
+            if (id(on_timer_fired) && (now_ms - id(on_timer_fired_at_ms) >= 5000)) {
+              id(on_timer_fired) = false;
+              id(ac_on_timer).turn_off();
+              id(ac_power).turn_on();
+            }
+          } else {
+            id(on_timer_fired) = false;
           }
 
           if (id(ac_off_timer).state) {
-            uint16_t target_min = id(ac_state)[8] * 60 + id(ac_state)[9];    // B2:B3
+            uint16_t target_min = id(ac_state)[8] * 60 + (id(ac_state)[9] & 0x7F);    // B2:B3 (bit 0x80 in B3 = on-timer flag, not minute)
             uint16_t scheduled = (uint16_t)(target_min - id(off_timer_arm_minutes) + 1440) % 1440;
             uint16_t elapsed = (uint16_t)(now_min - id(off_timer_arm_minutes) + 1440) % 1440;
-            if (elapsed >= scheduled) {
-              id(ac_off_timer).turn_off();
+            if (!id(off_timer_fired) && elapsed >= scheduled) {
+              id(off_timer_fired) = true;
+              id(off_timer_fired_at_ms) = now_ms;
             }
+            if (id(off_timer_fired) && (now_ms - id(off_timer_fired_at_ms) >= 5000)) {
+              id(off_timer_fired) = false;
+              id(ac_off_timer).turn_off();
+              id(ac_power).turn_off();
+            }
+          } else {
+            id(off_timer_fired) = false;
           }
 
 # -----------------------------------------------------------------------------
@@ -179,6 +208,22 @@ globals:
     initial_value: '0'
   - id: off_timer_arm_minutes
     type: uint16_t
+    restore_value: false
+    initial_value: '0'
+  - id: on_timer_fired
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: on_timer_fired_at_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: off_timer_fired
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: off_timer_fired_at_ms
+    type: uint32_t
     restore_value: false
     initial_value: '0'
 
@@ -414,9 +459,12 @@ switch:
           // Hour/minute are read from the "staging" number entities - same
           // as on the real remote, where you dial in a time on the display
           // and only the confirm press actually sends it.
-          id(ac_state)[9] = 0x80;                          // bit 0x80 in B3 = ON-TIMER active
+          // OR/mask (not a plain assignment): B3 shares its byte with the
+          // off-timer minute (low 7 bits) and B5 with the iFeel flag (bit
+          // 0x80) - see PROTOCOL.md.
+          id(ac_state)[9] |= 0x80;                          // bit 0x80 in B3 = ON-TIMER active
           id(ac_state)[10] = (uint8_t) id(ac_on_timer_hour).state;    // B4 = target hour
-          id(ac_state)[11] = (uint8_t) id(ac_on_timer_minute).state;  // B5 = target minute
+          id(ac_state)[11] = (id(ac_state)[11] & 0x80) | ((uint8_t) id(ac_on_timer_minute).state & 0x7F);  // B5 = target minute
           id(ac_state)[15] = 0x05;    // C1 = "on-timer" family code
           // Arm time - needed to correctly handle a midnight rollover in the
           // auto-cancel logic above.
@@ -427,9 +475,9 @@ switch:
       - script.execute: transmit_ac_state
     turn_off_action:
       - lambda: |-
-          id(ac_state)[9] = 0x00;     // B3 = ON-TIMER inactive
+          id(ac_state)[9] &= 0x7F;    // B3 = ON-TIMER inactive (preserve any off-timer minute in the low bits)
           id(ac_state)[10] = 0x00;    // B4 = target hour reset to zero
-          id(ac_state)[11] = 0x00;    // B5 = target minute reset to zero
+          id(ac_state)[11] &= 0x80;   // B5 = target minute reset to zero (preserve any iFeel flag)
           id(ac_state)[15] = 0x05;    // C1 = "on-timer" family code
       - script.execute: transmit_ac_state
 
@@ -445,7 +493,9 @@ switch:
           // since B1 is recomputed from the current time there anyway.
           id(off_timer_active) = true;
           id(ac_state)[8] = (uint8_t) id(ac_off_timer_hour).state;    // B2 = target hour
-          id(ac_state)[9] = (uint8_t) id(ac_off_timer_minute).state;  // B3 = target minute
+          // OR/mask (not a plain assignment): B3 shares its byte with the
+          // on-timer active flag (bit 0x80) - see PROTOCOL.md.
+          id(ac_state)[9] = (id(ac_state)[9] & 0x80) | ((uint8_t) id(ac_off_timer_minute).state & 0x7F);  // B3 = target minute
           id(ac_state)[15] = 0x1D;    // C1 = "off-timer" family code
           // Arm time - needed to correctly handle a midnight rollover in the
           // auto-cancel logic above.
@@ -458,7 +508,7 @@ switch:
       - lambda: |-
           id(off_timer_active) = false;
           id(ac_state)[8] = 0x00;     // B2 = target hour reset to zero
-          id(ac_state)[9] = 0x00;     // B3 = target minute reset to zero
+          id(ac_state)[9] &= 0x80;    // B3 = target minute reset to zero (preserve any on-timer flag)
           id(ac_state)[15] = 0x1D;    // C1 = "off-timer" family code
       - script.execute: transmit_ac_state
 

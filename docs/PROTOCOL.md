@@ -143,8 +143,8 @@ described below — the Off-timer active flag.
 | **Swing** | bit `0x40` in `B2` | **Stateless toggle, not persistent state**: the remote doesn't track "swing is on" — every press sends the same "toggle swing" pulse and the AC handles the actual louver position itself. Confirmed byte-identical across repeated presses; no distinct "off" variant exists at the byte level. **Must always be cleared right after sending** (see the C1 note above) — otherwise it re-fires on every subsequent, unrelated command. |
 | **Economy** | bit `0x20` in `C0` | 1 = on / 0 = off. Same pattern as Quiet — `C1=0x0C` constant for both on and off, only the `C0` bit (and therefore the checksum) changes. No side effects on other bytes observed. |
 | **iFeel** | bit `0x80` in `B5` + raw temperature in `B6` | 1 = on / 0 = off (`B5`). `B6` = room temperature as measured by the remote, a raw byte (not BCD), only set while iFeel is on (otherwise `0x00`). `C1=0x0D` constant for both on and off; `C0` unchanged. |
-| **On-timer** | active flag `B3`=`0x80`/`0x00`, target hour `B4` (raw 0–23), target minute `B5` (raw 0–59) | Absolute encoding, not a relative countdown (the same target hour captured at different real times produced identical bytes). Cancelling the timer zeroes `B3`, `B4` and `B5` together. `C1=0x05` constant for both setting and cancelling. Independently confirmed by the original remote's dedicated "cancel timer" button. |
-| **Off-timer** | active flag `0x80` in **`B1`** (shared byte with the current-minute clock field!), target hour `B2` (raw 0–23), target minute `B3` (raw 0–59) | See the [important note below](#b1-is-not-just-a-clock-byte) — the active flag is **not** in `B2`/`B3` as might be assumed by analogy with the on-timer; it's a separate bit stashed in the high bit of `B1`. `C1=0x1D` constant for setting and cancelling. |
+| **On-timer** | active flag `0x80` in **`B3`** (shared byte with the off-timer's target minute!), target hour `B4` (raw 0–23), target minute `B5` (raw 0–59, shared byte with the iFeel flag `0x80`) | Absolute encoding, not a relative countdown (the same target hour captured at different real times produced identical bytes). Cancelling the timer zeroes `B4`/`B5` and clears only the flag bit in `B3`, preserving whatever the off-timer put in the low 7 bits. `C1=0x05` constant for both setting and cancelling. Independently confirmed by the original remote's dedicated "cancel timer" button. |
+| **Off-timer** | active flag `0x80` in **`B1`** (shared byte with the current-minute clock field!), target hour `B2` (raw 0–23), target minute `B3` (raw 0–59, shared byte with the on-timer's active flag) | See the [important note below](#b1-is-not-just-a-clock-byte) — the active flag is **not** in `B2`/`B3` as might be assumed by analogy with the on-timer; it's a separate bit stashed in the high bit of `B1`. `C1=0x1D` constant for setting and cancelling. |
 | **Display backlight (dimmer)** | bit `0x20` in `B0`, `C1=0x00` | **Stateless toggle, same pattern as Swing**: repeated presses produce a byte-identical frame. The unit tracks the actual backlight state itself. **Must be cleared right after sending**, same reasoning as Swing. |
 | **Sleep** | bit `0x08` in `A2`, `C1=0x03` | 1 = on / 0 = off. No side effects on other bytes (fan speed in the low 2 bits of `A2` unchanged, mode/temperature unchanged). |
 | **Current time (clock)** | `B0` = `0x80 + current hour` (0-23, high bit always 1); `B1` low 7 bits = current minute (0-59) | The remote transmits its own live clock in **every** frame, regardless of `C1`. Confirmed hour-exact across 20+ captures spanning real hours 2 through 7 and 21; minute matches within −1 to −2 (ordinary clock drift between the remote and the logging PC). |
@@ -169,6 +169,27 @@ active off-timer, indistinguishable from the user having actually set one.
 See the ESPHome config's `transmit_ac_state` script for how this is handled
 correctly (a persistent flag OR'd back into `B1` after the minute is
 recomputed, on every transmission).
+
+### B3 and B5 are shared too — and no capture has both timers active at once
+
+`B3` doubles as the on-timer's active flag (`0x80`) *and* the off-timer's
+target minute (low 7 bits); `B5` doubles as the on-timer's target minute
+(low 7 bits) *and* the iFeel active flag (`0x80`). Both are handled with
+OR/mask operations (never a plain overwrite) so setting one doesn't stomp
+on the other's data — the same defensive pattern used for the dimmer bit
+in `B0` and the off-timer flag in `B1`. This is a **defensive, unverified**
+fix: no capture in this project has both the on-timer and off-timer (or
+on-timer and iFeel) active in the same frame, so the exact real-world
+byte layout for that combination hasn't been directly observed — only
+inferred from each field's role in isolation.
+
+Because of this residual uncertainty, the ESPHome config doesn't rely
+purely on the AC's own internal timer firing correctly. Instead, once a
+timer's target time is reached (plus a short safety margin), the ESP
+directly turns AC power on/off itself, via the same code path a manual
+power toggle would use. This makes the actual real-world outcome (the
+unit turning on/off at the right time) independent of any subtlety in the
+timer-arming bytes that might still not be fully understood.
 
 ## 8. Data quality note
 
